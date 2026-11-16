@@ -1,0 +1,167 @@
+#include <Wire.h>
+#include <SoftwareSerial.h>
+
+const int BT_RX = 2;
+const int BT_TX = 3;
+const int TRIG = 7;
+const int ECHO = 8;
+
+SoftwareSerial BTSerial(BT_RX, BT_TX);
+
+const int MPU1_ADDR = 0x68;
+const int MPU2_ADDR = 0x69;
+
+// ★ 캘리브레이션 값 (유지)
+const double OFFSET_TP = 0;  
+const double OFFSET_TR = 0; 
+const double OFFSET_SP = 10;  
+const double OFFSET_SR = 50;  
+
+double thighPitch, thighRoll, shankPitch, shankRoll;
+double finalFlexion; 
+// ★ 필터링된 쏠림 값을 저장할 변수 (전역 변수로 선언해야 누적됨)
+double filteredValgus = 0.0; 
+
+int distance = 0;
+int stepCount = 0;      
+boolean isFolded = false;
+
+int currentMode = 1; 
+
+// [사이클 분석 변수]
+double maxFlexionInCycle = 0; 
+boolean isMoving = false;    
+
+// 앱 결과값
+int displayFlexState = 0;  
+int displayValgusState = 2;
+
+void setup() {
+  Wire.begin();
+  Serial.begin(9600);
+  BTSerial.begin(9600);
+  pinMode(TRIG, OUTPUT);
+  pinMode(ECHO, INPUT);
+  initMPU(MPU1_ADDR);
+  initMPU(MPU2_ADDR);
+}
+
+void loop() {
+  // 0. 모드
+  if (BTSerial.available()) {
+    char cmd = BTSerial.read();
+    if (cmd == '1') currentMode = 1;
+    else if (cmd == '2') currentMode = 2;
+    else if (cmd == '3') currentMode = 3;
+  }
+
+  // 1. 걸음 수
+  digitalWrite(TRIG, LOW); delayMicroseconds(2);
+  digitalWrite(TRIG, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG, LOW);
+  long duration = pulseIn(ECHO, HIGH);
+  distance = duration * 0.034 / 2;
+  if (distance > 200 || distance < 0) distance = 0; 
+  if (distance > 0 && distance < 20) isFolded = true; 
+  else if (distance > 30 && isFolded == true) {
+    stepCount++; isFolded = false; 
+  }
+
+  // 2. 각도 계산
+  readMPU(MPU1_ADDR, &thighPitch, &thighRoll);
+  readMPU(MPU2_ADDR, &shankPitch, &shankRoll);
+
+  double cor_TP = thighPitch - OFFSET_TP;
+  double cor_TR = thighRoll - OFFSET_TR;
+  double cor_SP = shankPitch - OFFSET_SP;
+  double cor_SR = shankRoll - OFFSET_SR;
+
+  double diffFlex = cor_TP - cor_SP;
+  while (diffFlex <= -180) diffFlex += 360;
+  while (diffFlex > 180) diffFlex -= 360;
+  finalFlexion = abs(diffFlex); 
+
+  double diffValgus = cor_TR - cor_SR;
+  while (diffValgus <= -180) diffValgus += 360;
+  while (diffValgus > 180) diffValgus -= 360;
+  
+  // -----------------------------------------------------------
+  // ★ [핵심] 쏠림 값 필터링 (쇼바 장착!)
+  // -----------------------------------------------------------
+  double rawValgus = 0;
+  
+  if (finalFlexion > 80) {
+    rawValgus = 0.0; // 다리 많이 들면 0 처리
+  } else {
+    // ★ 나누기 삭제! 원본 값을 그대로 씀 (반응성 100%)
+    rawValgus = diffValgus; 
+  }
+
+  // ★ 이동 평균 필터 (Low Pass Filter)
+  // 이전 값 90% + 현재 값 10% -> 숫자가 부드럽게 변함 (튀는 거 방지)
+  filteredValgus = (filteredValgus * 0.9) + (rawValgus * 0.1);
+  filteredValgus = filteredValgus / 3;
+
+  // -----------------------------------------------------------
+  // 3. 로직 판단
+  // -----------------------------------------------------------
+  
+  // (A) 무릎 각도 (사이클)
+  if (finalFlexion > 20) {
+    isMoving = true;
+    if (finalFlexion > maxFlexionInCycle) maxFlexionInCycle = finalFlexion;
+  }
+  else if (finalFlexion < 15 && isMoving == true) {
+    isMoving = false; 
+    int goodMin = 0; int goodMax = 0;
+    if (currentMode == 1) { goodMin = 30; goodMax = 50; }
+    else if (currentMode == 2) { goodMin = 40; goodMax = 70; }
+    else if (currentMode == 3) { goodMin = 50; goodMax = 90; }
+
+    if (maxFlexionInCycle >= goodMin && maxFlexionInCycle <= goodMax) displayFlexState = 1; 
+    else if (maxFlexionInCycle < goodMin) {
+      if (maxFlexionInCycle < goodMin - 15) displayFlexState = 31; 
+      else displayFlexState = 21; 
+    } else {
+      if (maxFlexionInCycle > goodMax + 15) displayFlexState = 32; 
+      else displayFlexState = 22; 
+    }
+    maxFlexionInCycle = 0;
+  }
+
+  // 준비 상태
+  static unsigned long lastMoveTime = 0;
+  if (isMoving) lastMoveTime = millis();
+  if (millis() - lastMoveTime > 3000 && finalFlexion < 15) {
+     displayFlexState = 0; 
+  }
+
+  // (B) ★ 무릎 쏠림 (실시간 + 필터값 사용)
+  // 기준: 5도 (이제 원본 값이니까 5도는 꽤 작은 각도임. 잘 잡힘)
+  // 필터링된 값(filteredValgus)을 사용해서 판단!
+  
+  if (filteredValgus < -4) displayValgusState = 3;      // 바깥 (O자)
+  else if (filteredValgus > 4) displayValgusState = 1;  // 안쪽 (X자)
+  else displayValgusState = 2;                          // 정상
+
+  // -----------------------------------------------------------
+  // 4. 전송
+  // -----------------------------------------------------------
+  // 앱 그래프에는 부드러운 필터 값을 보내줌
+  BTSerial.print(finalFlexion, 0); BTSerial.print(",");
+  BTSerial.print(filteredValgus, 0);  BTSerial.print(","); // 필터 값 전송
+  BTSerial.print(stepCount);       BTSerial.print(",");
+  BTSerial.print(currentMode);     BTSerial.print(",");
+  BTSerial.print(displayFlexState); BTSerial.print(",");
+  BTSerial.println(displayValgusState);   
+  
+  delay(50); // 반응 속도 더 올림 (필터 믿고 빠르게!)
+}
+
+void initMPU(int address) { Wire.beginTransmission(address); Wire.write(0x6B); Wire.write(0); Wire.endTransmission(true); }
+void readMPU(int address, double *pitch, double *roll) {
+  Wire.beginTransmission(address); Wire.write(0x3B); Wire.endTransmission(false);
+  Wire.requestFrom(address, 6, true);
+  int16_t AcX = Wire.read()<<8|Wire.read(); int16_t AcY = Wire.read()<<8|Wire.read(); int16_t AcZ = Wire.read()<<8|Wire.read();
+  *pitch = atan2(AcY, AcZ) * 180 / PI; *roll  = atan2(AcX, AcZ) * 180 / PI;
+}
